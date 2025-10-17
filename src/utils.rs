@@ -6,7 +6,11 @@ use std::{
     path::PathBuf,
     process,
 };
-use sysinfo::System;
+
+use sysinfo::Disks;
+
+#[cfg(unix)]
+use block_devs::BlckExt;
 
 /// Represents either a file or stdin for input
 pub enum InputSource {
@@ -133,7 +137,7 @@ pub fn open_output_file(path: Option<&PathBuf>) -> io::Result<OutputSource> {
             match path_str.as_ref() {
                 "/dev/null" => Ok(OutputSource::DevNull),
                 "/dev/full" => Ok(OutputSource::DevFull),
-                _ => Ok(OutpuSource::File(
+                _ => Ok(OutputSource::File(
                     OpenOptions::new().write(true).create(true).open(path)?,
                 )),
             }
@@ -142,45 +146,243 @@ pub fn open_output_file(path: Option<&PathBuf>) -> io::Result<OutputSource> {
     }
 }
 
-/// Gets available space on filesystem for a file path
-fn get_avialable_space(path: &PathBuf) -> io::Result<Option<u64>> {
-    let mut sys = System::new();
-    sys.refresh_disks_list();
+fn get_available_space(path: &PathBuf) -> io::Result<Option<u64>> {
+    let disks = Disks::new_with_refreshed_list();
 
-    // Get the absolute path to properly match against disk mount points
-    let abs_path = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // If path doesn't exist, try the parent directory
-            match path.parent() {
-                Some(parent) => match parent.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => return Ok(None),
-                },
-                None => return Ok(None),
+    for disk in &disks {
+        let disk_name = disk.name().to_string_lossy();
+        if path.to_string_lossy() == disk_name {
+            return Ok(Some(disk.total_space()));
+        }
+
+        #[cfg(not(windows))]
+        {
+            if let Some(device_name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(disk_device_name) = std::path::Path::new(&disk_name.to_string())
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    if device_name == disk_device_name {
+                        return Ok(Some(disk.total_space()));
+                    }
+                }
             }
         }
+    }
+
+    get_block_device_size(path)
+}
+
+fn get_block_device_size(path: &PathBuf) -> io::Result<Option<u64>> {
+    #[cfg(unix)]
+    {
+        get_unix_block_device_size(path)
+    }
+
+    #[cfg(windows)]
+    {
+        get_windows_block_device_size(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn get_unix_block_device_size(path: &PathBuf) -> io::Result<Option<u64>> {
+    match File::open(path) {
+        Ok(file) => match file.get_block_device_size() {
+            Ok(size) => Ok(Some(size)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(windows)]
+fn get_windows_block_device_size(path: &PathBuf) -> io::Result<Option<u64>> {
+    use std::ffi::CString;
+    use std::mem;
+    use std::ptr;
+    use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::ioapiset::DeviceIoControl;
+    use winapi::um::winioctl::IOCTL_DISK_GET_DRIVE_GEOMETRY_EX;
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
+
+    let path_str = path.to_string_lossy();
+
+    let device_path = if path_str.starts_with("\\\\.\\") {
+        path_str.to_string()
+    } else if path_str.starts_with("PhysicalDrive") {
+        format!("\\\\.\\{}", path_str)
+    } else if let Some(drive_letter) = path_str.chars().next() {
+        if path_str.len() == 2 && path_str.ends_with(':') {
+            format!("\\\\.\\{}:", drive_letter)
+        } else {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
     };
 
-    // Find the disk that contains this path
-    let mut best_match = None;
-    let mut best_match_len = 0;
+    let c_path = match CString::new(device_path) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
 
-    for disk in sys.disks() {
-        let mount_point = disk.mount_point();
-        if abs_path.starts_with(mount_point) {
-            let mount_point_len = mount_point.as_os_str().len();
-            if mount_point_len > best_match_len {
-                best_match = Some(disk);
-                best_match_len = mount_point_len;
+    let handle = CreateFileA(
+        c_path.as_ptr(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        ptr::null_mut(),
+        OPEN_EXISTING,
+        0,
+        ptr::null_mut(),
+    );
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Ok(None);
+    }
+
+    #[repr(C)]
+    struct DiskGeometryEx {
+        geometry: [u8; 32],
+        disk_size: u64,
+        data: [u8; 8],
+    }
+
+    let mut geometry = DiskGeometryEx {
+        geometry: [0; 32],
+        disk_size: 0,
+        data: [0; 8],
+    };
+    let mut bytes_returned = 0u32;
+
+    let success = DeviceIoControl(
+        handle,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+        ptr::null_mut(),
+        0,
+        &mut geometry as *mut _ as *mut _,
+        mem::size_of::<DiskGeometryEx>() as u32,
+        &mut bytes_returned,
+        ptr::null_mut(),
+    );
+
+    CloseHandle(handle);
+
+    if success != 0 {
+        Ok(Some(geometry.disk_size))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_system_drive(path: &PathBuf) -> bool {
+    let disks = Disks::new_with_refreshed_list();
+    let path_str = path.to_string_lossy();
+
+    for disk in &disks {
+        let mount_point = disk.mount_point().to_string_lossy();
+
+        #[cfg(unix)]
+        {
+            if mount_point == "/" || mount_point == "/boot" || mount_point == "/usr" {
+                if path_str.contains(disk.name().to_string_lossy().as_ref()) {
+                    return true;
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if mount_point.starts_with("C:") {
+                if path_str.contains(disk.name().to_string_lossy().as_ref()) {
+                    return true;
+                }
             }
         }
     }
 
-    match best_match {
-        Some(disk) => Ok(Some(disk.available_space())),
-        None => Ok(None),
+    false
+}
+
+fn check_and_handle_mount(path: &PathBuf, is_output: bool) -> io::Result<()> {
+    if !is_output {
+        return Ok(());
     }
+
+    if is_system_drive(path) {
+        return Ok(());
+    }
+
+    let disks = Disks::new_with_refreshed_list();
+    let path_str = path.to_string_lossy();
+
+    for disk in &disks {
+        let disk_name = disk.name().to_string_lossy();
+        let mount_point = disk.mount_point();
+
+        let is_mounted = path_str == disk_name || {
+            #[cfg(not(windows))]
+            {
+                if let Some(device_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(disk_device_name) = std::path::Path::new(&disk_name.to_string())
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                    {
+                        device_name == disk_device_name
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            #[cfg(windows)]
+            {
+                false
+            }
+        };
+
+        if is_mounted {
+            eprintln!(
+                "Device {} is mounted at {}",
+                path_str,
+                mount_point.display()
+            );
+            eprintln!("Unmounting for safe operation...");
+
+            #[cfg(unix)]
+            {
+                let umount_result = std::process::Command::new("umount")
+                    .arg(mount_point)
+                    .output();
+
+                match umount_result {
+                    Ok(output) if output.status.success() => {
+                        eprintln!("Unmounted successfully");
+                        return Ok(());
+                    }
+                    _ => {
+                        eprintln!("Failed to unmount. Please unmount manually.");
+                        process::exit(1);
+                    }
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                eprintln!("Please eject/unmount the device manually and try again.");
+                process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Get the progress target size based on input/output combination
@@ -191,7 +393,10 @@ pub fn get_progress_target(
 ) -> io::Result<(Option<u64>, ProgressType)> {
     match input {
         InputSource::File(file) => {
-            // Regular file input - use file size
+            if let Some(path) = output_path {
+                check_and_handle_mount(path, true)?;
+            }
+
             let size = file.metadata()?.len();
             Ok((Some(size), ProgressType::FileTransfer))
         }
@@ -204,7 +409,10 @@ pub fn get_progress_target(
             Ok((Some(0), ProgressType::FileTransfer))
         }
         InputSource::DevZero => {
-            // Infinite zeros - base on output capacity
+            if let Some(path) = output_path {
+                check_and_handle_mount(path, true)?;
+            }
+
             match output {
                 OutputSource::File(_) => {
                     if let Some(path) = output_path {
@@ -221,7 +429,10 @@ pub fn get_progress_target(
             }
         }
         InputSource::DevUrandom => {
-            // Infinite random - base on output capacity
+            if let Some(path) = output_path {
+                check_and_handle_mount(path, true)?;
+            }
+
             match output {
                 OutputSource::File(_) => {
                     if let Some(path) = output_path {
@@ -249,27 +460,14 @@ pub enum ProgressType {
     FillWithRandom,
 }
 
-/// Get the size of a file in bytes, if there's no file the size will be unknown
-pub fn get_file_size(source: &InputSource) -> io::Result<Option<u64>> {
-    match source {
-        InputSource::File(file) => Ok(Some(file.metadata()?.len())),
-        InputSource::Stdin(_) => Ok(None),
-        InputSource::DevZero | InputSource::DevUrandom => Ok(None), // Infinite
-        InputSource::DevNull => Ok(Some(0)),                        // Always empty
-    }
-}
-
-/// Checks if an input source is infinite
-pub fn is_infinite_source(source: &InputSource) -> bool {
-    matches!(source, InputSource::DevZero | InputSource::DevUrandom)
-}
-
 /// Creates a progress bar with the specified total size
-pub fn create_progress_bar(total_size: Option<u64>, is_infinite: bool) -> ProgressBar {
+pub fn create_progress_bar(total_size: Option<u64>, progress_type: ProgressType) -> ProgressBar {
     let pb;
 
-    match (total_size, is_infinite) {
-        (Some(size), false) => {
+    match (total_size, &progress_type) {
+        (Some(size), ProgressType::FileTransfer)
+        | (Some(size), ProgressType::FillWithZeros)
+        | (Some(size), ProgressType::FillWithRandom) => {
             pb = ProgressBar::new(size);
             pb.set_style(
                 ProgressStyle::with_template(
@@ -281,9 +479,18 @@ pub fn create_progress_bar(total_size: Option<u64>, is_infinite: bool) -> Progre
         }
         _ => {
             pb = ProgressBar::new_spinner();
+            let _message = match progress_type {
+                ProgressType::FileTransfer => "Copying",
+                ProgressType::StreamTransfer => "Streaming",
+                ProgressType::FillWithZeros => "Filling with zeros",
+                ProgressType::FillWithRandom => "Filling with random data",
+            };
+
             pb.set_style(
-                ProgressStyle::with_template("[{elapsed_precise}] {spinner:.cyan} {bytes} {msg}")
-                    .unwrap(),
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {spinner:.cyan} {bytes} {message}",
+                )
+                .unwrap(),
             );
         }
     }
@@ -292,10 +499,15 @@ pub fn create_progress_bar(total_size: Option<u64>, is_infinite: bool) -> Progre
 }
 
 /// Finish the progress bar with a completion message
-pub fn finish_pb_with_message(pb: ProgressBar, total_size: Option<u64>, msg: impl Into<String>) {
-    match total_size {
-        _ => pb.finish_with_message(msg.into()),
-    }
+pub fn finish_pb_with_message(pb: ProgressBar, progress_type: ProgressType) {
+    let msg = match progress_type {
+        ProgressType::FileTransfer => "File copy complete!",
+        ProgressType::StreamTransfer => "Stream complete!",
+        ProgressType::FillWithZeros => "Data has been overwritten with zeros!",
+        ProgressType::FillWithRandom => "Data has been overwritten with random data!",
+    };
+
+    pb.finish_with_message(msg);
 }
 
 /// Create a buffer of the specified size
@@ -303,21 +515,24 @@ pub fn create_buffer(size: usize) -> Vec<u8> {
     vec![0; size]
 }
 
-/// Copy the data from input to output with progress tracking
-pub fn copy_with_progress(
+/// Copy the data from input to output with callback for progress tracking
+pub fn copy_with_callback<F>(
     input: &mut InputSource,
     output: &mut OutputSource,
     buffer_size: usize,
-    pb: &ProgressBar,
-) -> io::Result<()> {
+    mut callback: F,
+) -> io::Result<()>
+where
+    F: FnMut(u64),
+{
     let mut buffer = create_buffer(buffer_size);
 
     loop {
         match input.read(&mut buffer) {
-            Ok(0) => break, // Reached the end of the file
+            Ok(0) => break,
             Ok(bytes_read) => {
                 output.write_all(&buffer[..bytes_read])?;
-                pb.inc(bytes_read as u64);
+                callback(bytes_read as u64);
             }
             Err(e) => {
                 eprintln!("Error reading from input file: {e}");
@@ -327,4 +542,16 @@ pub fn copy_with_progress(
     }
 
     Ok(())
+}
+
+/// Copy the data from input to output with progress tracking
+pub fn copy_with_progress(
+    input: &mut InputSource,
+    output: &mut OutputSource,
+    buffer_size: usize,
+    pb: &ProgressBar,
+) -> io::Result<()> {
+    copy_with_callback(input, output, buffer_size, |bytes| {
+        pb.inc(bytes);
+    })
 }
