@@ -1,3 +1,4 @@
+use crossbeam::channel;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{RngCore, rng};
 use std::{
@@ -5,8 +6,13 @@ use std::{
     io::{self, Read, Write, stdin, stdout},
     path::PathBuf,
     process,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
 };
-
 use sysinfo::Disks;
 
 #[cfg(unix)]
@@ -515,43 +521,151 @@ pub fn create_buffer(size: usize) -> Vec<u8> {
     vec![0; size]
 }
 
-/// Copy the data from input to output with callback for progress tracking
-pub fn copy_with_callback<F>(
-    input: &mut InputSource,
-    output: &mut OutputSource,
-    buffer_size: usize,
-    mut callback: F,
-) -> io::Result<()>
-where
-    F: FnMut(u64),
-{
-    let mut buffer = create_buffer(buffer_size);
+struct DataBuffer {
+    data: Vec<u8>,
+    bytes_used: usize,
+}
 
-    loop {
-        match input.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(bytes_read) => {
-                output.write_all(&buffer[..bytes_read])?;
-                callback(bytes_read as u64);
-            }
-            Err(e) => {
-                eprintln!("Error reading from input file: {e}");
-                process::exit(1);
-            }
+impl DataBuffer {
+    fn new(size: usize) -> Self {
+        Self {
+            data: vec![0; size],
+            bytes_used: 0,
         }
     }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.bytes_used]
+    }
+}
+
+pub struct ThreadedCopyConfig {
+    pub buffer_size: usize,
+    pub buffer_count: usize,
+}
+
+pub fn copy_with_callback<F>(
+    mut input: InputSource,
+    mut output: OutputSource,
+    config: ThreadedCopyConfig,
+    callback: F,
+) -> io::Result<()>
+where
+    F: Fn(u64) + Send + Sync,
+{
+    let bytes_processed = Arc::new(AtomicU64::new(0));
+    let result = Arc::new(std::sync::Mutex::new(Ok(())));
+
+    let (empty_tx, empty_rx) = channel::bounded(config.buffer_count);
+    let (full_tx, full_rx) = channel::bounded(config.buffer_count);
+
+    for _ in 0..config.buffer_count {
+        empty_tx.send(DataBuffer::new(config.buffer_size)).unwrap();
+    }
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let read_result = (|| -> io::Result<()> {
+                loop {
+                    let mut buffer = match empty_rx.recv() {
+                        Ok(buf) => buf,
+                        Err(_) => break,
+                    };
+
+                    match input.read(&mut buffer.data) {
+                        Ok(0) => {
+                            drop(full_tx);
+                            break;
+                        }
+                        Ok(bytes_read) => {
+                            buffer.bytes_used = bytes_read;
+                            if full_tx.send(buffer).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = read_result {
+                *result.lock().unwrap() = Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Read error: {e}"),
+                ));
+            }
+        });
+
+        scope.spawn(|| {
+            let write_result = (|| -> io::Result<()> {
+                loop {
+                    let buffer = match full_rx.recv() {
+                        Ok(buf) => buf,
+                        Err(_) => break,
+                    };
+
+                    output.write_all(buffer.as_slice())?;
+                    output.flush()?;
+
+                    bytes_processed.fetch_add(buffer.bytes_used as u64, Ordering::Relaxed);
+
+                    if empty_tx.send(DataBuffer::new(config.buffer_size)).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = write_result {
+                *result.lock().unwrap() = Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Write error: {e}"),
+                ));
+            }
+        });
+
+        scope.spawn(|| {
+            let mut last_bytes = 0u64;
+            loop {
+                thread::sleep(Duration::from_millis(100));
+
+                let current_bytes = bytes_processed.load(Ordering::Relaxed);
+                let delta = current_bytes - last_bytes;
+
+                if delta > 0 {
+                    callback(delta);
+                    last_bytes = current_bytes;
+                }
+
+                if empty_rx.is_empty() && full_rx.is_empty() {
+                    let final_bytes = bytes_processed.load(Ordering::Relaxed);
+                    let final_delta = final_bytes - last_bytes;
+                    if final_delta > 0 {
+                        callback(final_delta);
+                    }
+                    break;
+                }
+            }
+        });
+    });
+
+    result
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
 
     Ok(())
 }
 
-/// Copy the data from input to output with progress tracking
 pub fn copy_with_progress(
-    input: &mut InputSource,
-    output: &mut OutputSource,
-    buffer_size: usize,
+    input: InputSource,
+    output: OutputSource,
+    config: ThreadedCopyConfig,
     pb: &ProgressBar,
 ) -> io::Result<()> {
-    copy_with_callback(input, output, buffer_size, |bytes| {
+    copy_with_callback(input, output, config, |bytes| {
         pb.inc(bytes);
     })
 }
