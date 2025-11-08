@@ -4,8 +4,8 @@ use crate::cli::Cli;
 use clap::Parser;
 use dd::utils::{copy_with_progress, create_progress_bar, finish_pb_with_message};
 use dd::{
-    InputSource, OutputSource, ProgressType, get_progress_target, open_input_file, open_output_file,
-    validate_special_device_combo,
+    InputSource, OutputSource, ProgressType, get_progress_target, open_input_file,
+    open_output_file, validate_special_device_combo,
 };
 use reqwest::blocking;
 use sha2::{Digest, Sha256};
@@ -95,7 +95,10 @@ fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     }
 
     let digest = hasher.finalize();
-    let got = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let got = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
 
     if !got.eq_ignore_ascii_case(expected.trim()) {
         return Err(io::Error::new(
