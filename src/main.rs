@@ -27,6 +27,7 @@ fn main() -> io::Result<()> {
 
     // Open the input and output files.
     let mut input_file = File::open(&args.input)?;
+
     let mut output_file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -49,19 +50,30 @@ fn main() -> io::Result<()> {
     let mut buffer = vec![0; args.block_size];
 
     loop {
-        match input_file.read(&mut buffer) {
-            Ok(0) => break, // Reached end of file
-            Ok(bytes_read) => {
-                output_file.write_all(&buffer[..bytes_read])?;
-                pb.inc(bytes_read as u64);
-            }
-            Err(e) => {
-                eprintln!("Error reading from input file: {}", e);
-                process::exit(1);
-            }
+        let mut bytes_read = 0;
+        while bytes_read < args.block_size {
+            let n = match input_file.read(&mut buffer[bytes_read..]) {
+                Ok(0) => break, // Reached end of file
+                Ok(b_read) => b_read,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, // Try read again
+                Err(e) => {
+                    eprintln!("Error reading from input file: {}", e);
+                    process::exit(1);
+                }
+            };
+            bytes_read += n;
         }
+
+        if bytes_read == 0 {
+            break; // End of file
+        }
+
+        output_file.write_all(&buffer[..bytes_read])?;
+        output_file.sync_data()?;
+        pb.inc(bytes_read as u64);
     }
 
     pb.finish_with_message("Copy complete!");
+    println!();
     Ok(())
 }
