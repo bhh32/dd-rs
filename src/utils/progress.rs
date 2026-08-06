@@ -83,15 +83,22 @@ pub enum ProgressType {
 /// Creates a progress bar with the specified total size
 pub fn create_progress_bar(total_size: Option<u64>, progress_type: ProgressType) -> ProgressBar {
     let pb;
+    let msg = match progress_type {
+        ProgressType::FileTransfer => "Copying",
+        ProgressType::StreamTransfer => "Streaming",
+        ProgressType::FillWithZeros => "Filling with zeros",
+        ProgressType::FillWithRandom => "Filling with random data",
+    };
 
     match (total_size, &progress_type) {
         (Some(size), ProgressType::FileTransfer)
         | (Some(size), ProgressType::FillWithZeros)
         | (Some(size), ProgressType::FillWithRandom) => {
             pb = ProgressBar::new(size);
+            pb.set_message(msg);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
                 )
                 .unwrap()
                 .progress_chars("=>-"),
@@ -99,18 +106,10 @@ pub fn create_progress_bar(total_size: Option<u64>, progress_type: ProgressType)
         }
         _ => {
             pb = ProgressBar::new_spinner();
-            let _message = match progress_type {
-                ProgressType::FileTransfer => "Copying",
-                ProgressType::StreamTransfer => "Streaming",
-                ProgressType::FillWithZeros => "Filling with zeros",
-                ProgressType::FillWithRandom => "Filling with random data",
-            };
-
+            pb.set_message(msg);
             pb.set_style(
-                ProgressStyle::with_template(
-                    "[{elapsed_precise}] {spinner:.cyan} {bytes} {message}",
-                )
-                .unwrap(),
+                ProgressStyle::with_template("[{elapsed_precise}] {spinner:.cyan} {bytes} {msg}")
+                    .unwrap(),
             );
         }
     }
